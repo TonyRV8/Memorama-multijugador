@@ -11,6 +11,8 @@ columnas = 0
 puntuaciones = {}
 cliente_socket = None
 juego_activo = True
+turno_actual = None  # Nueva variable para rastrear de quién es el turno
+mi_direccion = None  # Para almacenar la dirección del cliente actual
 
 def imprimir_tablero():
     print("\n  ", end="")
@@ -32,6 +34,13 @@ def imprimir_puntuaciones():
     print("\nPuntuaciones:")
     for addr, puntos in puntuaciones.items():
         print(f"Jugador {addr}: {puntos} puntos")
+    
+    # Mostrar información sobre el turno actual
+    if turno_actual:
+        if turno_actual == mi_direccion:
+            print("\n¡ES TU TURNO PARA JUGAR!")
+        else:
+            print(f"\nEs el turno del jugador {turno_actual}")
 
 def solicitar_coordenadas():
     while True:
@@ -191,8 +200,29 @@ def procesar_desconexion(data):
         print(f"Error al procesar mensaje de desconexión: {e}")
         print(f"Mensaje recibido: {data}")
 
+def procesar_turno(data):
+    global turno_actual
+    
+    try:
+        # TURNO:IP:puerto
+        partes = data.split(":")
+        turno_actual = partes[1]
+        if len(partes) > 2:
+            turno_actual = f"{turno_actual}:{partes[2]}"  # Asegurar formato IP:puerto
+        
+        print(f"Procesando turno, mi dirección: {mi_direccion}, turno actual: {turno_actual}")
+        
+        if turno_actual == mi_direccion:
+            print("\n¡ES TU TURNO PARA JUGAR!")
+        else:
+            print(f"\nEs el turno del jugador {turno_actual}")
+            
+    except Exception as e:
+        print(f"Error al procesar mensaje de turno: {e}")
+        print(f"Mensaje recibido: {data}")
+
 def hilo_escucha(cliente_socket):
-    global juego_activo
+    global juego_activo, turno_actual
     
     while juego_activo:
         try:
@@ -229,6 +259,15 @@ def hilo_escucha(cliente_socket):
                 procesar_desconexion(data)
             elif data.startswith("ERROR:"):
                 print(f"\nError: {data.split(':')[1]}")
+            elif data.startswith("TURNO:"):
+                procesar_turno(data)
+                # Mostrar tablero actualizado después del cambio de turno
+                imprimir_tablero()
+                imprimir_puntuaciones()
+            elif data.startswith("ESPERAR:"):
+                partes = data.split(":")
+                jugador_turno = partes[1]
+                print(f"\nNo es tu turno. Actualmente es el turno del jugador {jugador_turno}")
             else:
                 print(f"Mensaje desconocido del servidor: {data}")
                 
@@ -252,19 +291,29 @@ print("Cliente de Memorama Multijugador")
 host = input("Ingrese la dirección IP del servidor (presione Enter para usar 127.0.0.1): ") or "127.0.0.1"
     
 try:
-    puerto = int(input("Ingrese el puerto del servidor (presione Enter para usar 65432): ") or "65432")
+    puerto_local = 0  # Usar puerto dinámico asignado por el sistema
+    puerto_servidor = int(input("Ingrese el puerto del servidor (presione Enter para usar 65432): ") or "65432")
 except ValueError:
-    puerto = 65432
+    puerto_servidor = 65432
     print("Puerto inválido. Usando puerto 65432 por defecto.")
 
 # Crear socket TCP
 cliente_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
 try:
-    print(f"Conectando al servidor en {host}:{puerto}...")
-    cliente_socket.connect((host, puerto))
+    print(f"Conectando al servidor en {host}:{puerto_servidor}...")
+    cliente_socket.bind(('', puerto_local))  # Bind a cualquier interfaz, puerto dinámico
+    cliente_socket.connect((host, puerto_servidor))
+    
+    # Obtener el puerto local asignado
+    _, puerto_asignado = cliente_socket.getsockname()
+    
+    # Guardar mi dirección para comparaciones futuras
+    mi_direccion = f"{host}:{puerto_asignado}"
+    print(f"Conectado con dirección local: {mi_direccion}")
+    
     # Aumentar el tiempo de espera del socket
-    cliente_socket.settimeout(100)  # 30 segundos
+    cliente_socket.settimeout(100)  # 100 segundos
     print("Conexión establecida")
     
     # Recibir configuración inicial - CONFIG:dificultad:filas:columnas
@@ -287,6 +336,7 @@ try:
         print(f"Tablero de {filas}x{columnas}")
     else:
         print("Respuesta inesperada del servidor")
+        print(f"Mensaje recibido: {data}")
         juego_activo = False
     
     if juego_activo:
@@ -301,7 +351,16 @@ try:
             imprimir_tablero()
             imprimir_puntuaciones()
             
+            # Verificar si es nuestro turno
+            if turno_actual and turno_actual != mi_direccion:
+                print(f"Esperando tu turno... Actualmente es turno de {turno_actual}")
+                # Debug: mostrar detalles de las variables para diagnóstico
+                print(f"DEBUG - Mi dirección: '{mi_direccion}', Turno actual: '{turno_actual}'")
+                time.sleep(2)  # Esperar un poco antes de verificar de nuevo
+                continue
+            
             # Solicitar coordenadas al usuario
+            print("\n¡ES TU TURNO! Selecciona las casillas:")
             fila1, col1, fila2, col2 = solicitar_coordenadas()
             
             # Enviar jugada al servidor - JUGAR:fila1,col1:fila2,col2

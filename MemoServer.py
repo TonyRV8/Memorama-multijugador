@@ -32,6 +32,11 @@ casillas_destapadas = 0
 tiempo_inicio = time.time()
 juego_activo = True
 
+# Variables para control de turnos
+turno_actual = None  # Almacena el cliente que tiene el turno actualmente
+orden_turnos = []    # Lista ordenada de jugadores
+condiciones_clientes = {}  # Condiciones para cada cliente {addr_str: threading.Condition()}
+
 def inicializar_tablero():
     global tablero, tablero_visible
     
@@ -94,6 +99,10 @@ def imprimir_tablero_servidor():
     print("\nPuntuaciones:")
     for addr_str, puntos in puntuaciones.items():
         print(f"Jugador {addr_str}: {puntos} puntos")
+    
+    if turno_actual:
+        print(f"\nTurno actual: {turno_actual}")
+    print(f"Orden de turnos: {orden_turnos}")
 
 def procesar_jugada(fila1, col1, fila2, col2, cliente_ip, cliente_puerto):
     global tablero_visible, casillas_destapadas, juego_activo
@@ -138,6 +147,43 @@ def procesar_jugada(fila1, col1, fila2, col2, cliente_ip, cliente_puerto):
         
         return acierto, contenido1, contenido2, cliente_addr_str
 
+def cambiar_turno(mantener_turno=False):
+    global turno_actual
+    
+    with lock:
+        # Si no hay jugadores, no hay turno
+        if not orden_turnos:
+            turno_actual = None
+            return
+            
+        # Si el jugador acertó, mantiene su turno
+        if mantener_turno and turno_actual in orden_turnos:
+            print(f"Jugador {turno_actual} acertó y mantiene su turno.")
+            return
+            
+        # Obtener el índice del turno actual
+        try:
+            indice_actual = orden_turnos.index(turno_actual)
+        except ValueError:
+            indice_actual = -1
+            
+        # Calcular el siguiente turno
+        if indice_actual >= 0 and indice_actual < len(orden_turnos) - 1:
+            indice_siguiente = indice_actual + 1
+        else:
+            indice_siguiente = 0
+            
+        # Establecer siguiente turno
+        turno_actual = orden_turnos[indice_siguiente]
+        print(f"Cambiando turno al jugador {turno_actual}")
+        
+        # Notificar a todos los clientes sobre el cambio
+        enviar_a_todos(f"TURNO:{turno_actual}")
+        
+        # Despertar al cliente que tiene el turno
+        if turno_actual in condiciones_clientes:
+            condiciones_clientes[turno_actual].notify_all()
+
 def obtener_tablero_visible_json():
     with lock:
         return json.dumps(tablero_visible)
@@ -147,20 +193,47 @@ def obtener_puntuaciones_json():
         return json.dumps(puntuaciones)
 
 def agregar_cliente(conn, cliente_ip, cliente_puerto):
+    global turno_actual, orden_turnos
+    
     with lock:
         cliente_addr_str = f"{cliente_ip}:{cliente_puerto}"
         conexiones_clientes[cliente_addr_str] = conn
         puntuaciones[cliente_addr_str] = 0
         
+        # Crear una condición para este cliente
+        condiciones_clientes[cliente_addr_str] = threading.Condition(lock)
+        
+        # Añadir cliente al orden de turnos
+        orden_turnos.append(cliente_addr_str)
+        
+        # Si es el primer cliente, darle el primer turno
+        if turno_actual is None:
+            turno_actual = cliente_addr_str
+            print(f"Primer cliente conectado. Asignando turno a {turno_actual}")
+        
 def eliminar_cliente(cliente_ip, cliente_puerto):
+    global turno_actual, orden_turnos
+    
     with lock:
         cliente_addr_str = f"{cliente_ip}:{cliente_puerto}"
+        era_su_turno = (cliente_addr_str == turno_actual)
+        
         if cliente_addr_str in conexiones_clientes:
             del conexiones_clientes[cliente_addr_str]
         if cliente_addr_str in hilos_clientes:
             del hilos_clientes[cliente_addr_str]
         if cliente_addr_str in puntuaciones:
             del puntuaciones[cliente_addr_str]
+        if cliente_addr_str in condiciones_clientes:
+            del condiciones_clientes[cliente_addr_str]
+        
+        # Quitar del orden de turnos
+        if cliente_addr_str in orden_turnos:
+            orden_turnos.remove(cliente_addr_str)
+            
+        # Si era su turno, pasar al siguiente
+        if era_su_turno and orden_turnos:
+            cambiar_turno(False)
             
 def registrar_hilo(cliente_ip, cliente_puerto, hilo):
     with lock:
@@ -246,27 +319,32 @@ def manejar_cliente(client_conn, client_addr):
     # Extraer IP y puerto del cliente
     client_ip = client_addr[0]
     client_port = client_addr[1]
+    cliente_addr_str = f"{client_ip}:{client_port}"
     
-    # Añadir el cliente a la lista de conexiones
-    agregar_cliente(client_conn, client_ip, client_port)
-    
-    # Iniciar hilo para ping
-    ping_thread = threading.Thread(target=ping_cliente, args=(client_conn, client_ip, client_port))
-    ping_thread.daemon = True
-    ping_thread.start()
-
-    # Enviamos información de configuración
-    info_inicial = f"CONFIG:{dificultad}:{filas}:{columnas}"
     try:
+        # Enviamos información de configuración primero
+        info_inicial = f"CONFIG:{dificultad}:{filas}:{columnas}"
         client_conn.sendall(info_inicial.encode())
-    except:
-        eliminar_cliente(client_ip, client_port)
-        return
+        
+        # Añadir el cliente a la lista de conexiones
+        agregar_cliente(client_conn, client_ip, client_port)
+        
+        # Iniciar hilo para ping
+        ping_thread = threading.Thread(target=ping_cliente, args=(client_conn, client_ip, client_port))
+        ping_thread.daemon = True
+        ping_thread.start()
 
-    # Notificar a todos que un nuevo cliente se ha conectado
-    enviar_a_todos(f"CONEXION:{client_ip}:{client_port}", client_ip, client_port)
+        # Notificar a todos que un nuevo cliente se ha conectado
+        enviar_a_todos(f"CONEXION:{client_ip}:{client_port}", client_ip, client_port)
+        
+        # Notificar sobre el turno actual con manejo de errores
+        try:
+            if turno_actual:
+                client_conn.sendall(f"TURNO:{turno_actual}".encode())
+        except Exception as e:
+            print(f"Error al enviar turno a {cliente_addr_str}: {e}")
+            return
 
-    try:
         print(f"Cliente conectado desde {client_ip}:{client_port}")
         while juego_activo:
             try:
@@ -282,6 +360,18 @@ def manejar_cliente(client_conn, client_addr):
                 
                 # Procesar la jugada del formato JUGAR:fila1,col1:fila2,col2
                 if data.startswith("JUGAR:"):
+                    # Verificar si es el turno de este cliente
+                    with lock:
+                        if turno_actual != cliente_addr_str:
+                            # No es su turno, enviar mensaje de error
+                            try:
+                                client_conn.sendall(f"ESPERAR:{turno_actual}".encode())
+                            except Exception as e:
+                                print(f"Error al enviar mensaje de espera: {e}")
+                                break
+                            continue
+                    
+                    # Es su turno, procesar la jugada
                     partes = data.split(":")
                     coord1 = partes[1].split(",")
                     coord2 = partes[2].split(",")
@@ -294,10 +384,14 @@ def manejar_cliente(client_conn, client_addr):
                         fila1, col1, fila2, col2, client_ip, client_port
                     )
                     
-                    if isinstance(acierto, bool) and (contenido1 is None or contenido2 is None):
+                    if isinstance(acierto, bool) and contenido1 is None:
                         # Error en la jugada
-                        respuesta = f"ERROR:{contenido1}"
-                        client_conn.sendall(respuesta.encode())
+                        try:
+                            respuesta = f"ERROR:{contenido2}"
+                            client_conn.sendall(respuesta.encode())
+                        except Exception as e:
+                            print(f"Error al enviar respuesta: {e}")
+                            break
                         continue
                     
                     # Preparar información para broadcast
@@ -310,6 +404,9 @@ def manejar_cliente(client_conn, client_addr):
                     
                     # Imprimir el tablero completo después de cada jugada (solo visible en el servidor)
                     imprimir_tablero_servidor()
+                    
+                    # Cambiar turno basado en si hubo acierto
+                    cambiar_turno(acierto)  # Si acierto=True, mantiene turno
                     
                     # Verificar si el juego ha terminado
                     if not juego_activo:
@@ -380,6 +477,8 @@ def manejar_cliente(client_conn, client_addr):
                 print(f"Error con cliente {client_ip}:{client_port}: {e}")
                 break
 
+    except Exception as e:
+        print(f"Error en hilo cliente {client_ip}:{client_port}: {e}")
     finally:
         # Al terminar el bucle, el cliente se ha desconectado
         print(f"Cliente {client_ip}:{client_port} desconectado")
@@ -440,7 +539,7 @@ try:
         # Registrar el hilo
         registrar_hilo(client_ip, client_port, cliente_thread)
 
-        print(f"Cliente conectado: {client_ip}:{client_port}. Total: {len(conexiones_clientes)}")
+        print(f"Cliente conectado: {client_ip}:{client_port}. Total: {len(conexiones_clientes) + 1}")
 
 except KeyboardInterrupt:
     print("Servidor interrumpido. Cerrando...")
